@@ -1,3 +1,4 @@
+# coding=utf-8
 """Tests that run once"""
 import io
 import os
@@ -8,6 +9,7 @@ import tempfile
 import subprocess
 import contextlib
 import datetime
+import json
 
 # Third-party dependency
 import six
@@ -304,7 +306,7 @@ def ignoreQtMessageHandler(msgs):
 def test_environment():
     """Tests require all bindings to be installed (except PySide on py3.5+)"""
 
-    if sys.version_info <= (3, 4):
+    if sys.version_info < (3, 5):
         # PySide is not available for Python > 3.4
         imp.find_module("PySide")
     imp.find_module("PySide2")
@@ -550,6 +552,10 @@ def test_vendoring():
     shutil.copy(os.path.join(os.path.dirname(__file__), "Qt.py"),
                 os.path.join(vendor, "Qt.py"))
 
+    # Copy real Qt.py into the root folder
+    shutil.copy(os.path.join(os.path.dirname(__file__), "Qt.py"),
+                os.path.join(self.tempdir, "Qt.py"))
+
     print("Testing relative import..")
     assert subprocess.call(
         [sys.executable, "-c", "import myproject"],
@@ -572,6 +578,77 @@ def test_vendoring():
         cwd=self.tempdir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+    ) == 0
+
+    #
+    # Test invalid json data
+    #
+    env = os.environ.copy()
+    env["QT_PREFERRED_BINDING_JSON"] = '{"Qt":["PyQt5","PyQt4"],}'
+
+    cmd = "import myproject.vendor.Qt;"
+    cmd += "import Qt;"
+    cmd += "assert myproject.vendor.Qt.__binding__ != 'None', 'vendor';"
+    cmd += "assert Qt.__binding__ != 'None', 'Qt';"
+
+    popen = subprocess.Popen(
+        [sys.executable, "-c", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=self.tempdir,
+        env=env
+    )
+
+    out, err = popen.communicate()
+
+    if popen.returncode != 0:
+        print(out)
+        msg = "An exception was raised"
+        assert popen.returncode == 0, msg
+
+    error_check = b"Qt.py [warning]:"
+    assert err.startswith(error_check), err
+
+    print('out------------------')
+    print(out)
+
+    print('err ------------------')
+    print(err)
+
+    # Check QT_PREFERRED_BINDING_JSON works as expected
+    print("Testing QT_PREFERRED_BINDING_JSON is respected..")
+    cmd = "import myproject.vendor.Qt;"
+    # Check that the "None" binding was set for `import myproject.vendor.Qt`
+    cmd += "assert myproject.vendor.Qt.__binding__ == 'None', 'vendor';"
+    cmd += "import Qt;"
+    # Check that the "None" binding was not set for `import Qt`.
+    # This should be PyQt5 or PyQt4 depending on the test environment.
+    cmd += "assert Qt.__binding__ != 'None', 'Qt'"
+
+    # If the module name is "Qt" use PyQt5 or PyQt4, otherwise use None binding
+    env = os.environ.copy()
+    env["QT_PREFERRED_BINDING_JSON"] = json.dumps(
+        {
+            "Qt": ["PyQt5", "PyQt4"],
+            "default": ["None"]
+        }
+    )
+
+    assert subprocess.call(
+        [sys.executable, "-c", cmd],
+        stdout=subprocess.PIPE,
+        cwd=self.tempdir,
+        env=env
+    ) == 0
+
+    print("Testing QT_PREFERRED_BINDING_JSON and QT_PREFERRED_BINDING work..")
+    env["QT_PREFERRED_BINDING_JSON"] = '{"Qt":["PyQt5","PyQt4"]}'
+    env["QT_PREFERRED_BINDING"] = "None"
+    assert subprocess.call(
+        [sys.executable, "-c", cmd],
+        stdout=subprocess.PIPE,
+        cwd=self.tempdir,
+        env=env
     ) == 0
 
 
@@ -792,13 +869,55 @@ def test_membership():
     )
 
 
-if sys.version_info <= (3, 4):
+def test_missing():
+    """Missing members of Qt.py have been defined with placeholders"""
+    import Qt
+
+    missing_members = Qt._missing_members.copy()
+
+    missing = list()
+    for module, members in missing_members.items():
+
+        mod = getattr(Qt, module)
+        missing.extend(
+            member for member in members
+            if not hasattr(mod, member) or
+            not isinstance(getattr(mod, member), Qt.MissingMember)
+        )
+
+    binding = Qt.__binding__
+    assert not missing, (
+        "Some members did not exist in {binding} as "
+        "a Qt.MissingMember type\n{missing}".format(**locals())
+    )
+
+
+def test_unicode_error_messages():
+    """Test if unicode error messages with non-ascii characters
+    throw the error reporter off"""
+    import Qt
+    unicode_message = u"DLL load failed : le module spécifié est introuvable."
+    str_message = "DLL load failed : le module"
+
+    with captured_output() as out:
+        stdout, stderr = out
+        Qt._warn(text=unicode_message)
+        assert str_message in stderr.getvalue()
+
+
+if sys.version_info < (3, 5):
     # PySide is not available for Python > 3.4
     # Shiboken(1) doesn't support Python 3.5
     # https://github.com/PySide/shiboken-setup/issues/3
 
     def test_wrapInstance():
-        """.wrapInstance and .getCppPointer is identical across all bindings"""
+        """Tests .wrapInstance cast of pointer to explicit class
+
+        Note:
+            sip.wrapInstance will ignore the explicit class if there is a more
+            suitable type available.
+
+        """
         from Qt import QtCompat, QtWidgets
 
         app = QtWidgets.QApplication(sys.argv)
@@ -809,8 +928,14 @@ if sys.version_info <= (3, 4):
             pointer = QtCompat.getCppPointer(button)
             widget = QtCompat.wrapInstance(long(pointer),
                                            QtWidgets.QWidget)
-            assert isinstance(widget, QtWidgets.QWidget), widget
+
             assert widget.objectName() == button.objectName()
+
+            if binding("PyQt4") or binding("PyQt5"):
+                # Even when we explicitly pass QWidget we will get QPushButton
+                assert type(widget) is QtWidgets.QPushButton, widget
+            else:
+                assert type(widget) is QtWidgets.QWidget, widget
 
             # IMPORTANT: this differs across sip and shiboken.
             if binding("PySide") or binding("PySide2"):
@@ -821,8 +946,15 @@ if sys.version_info <= (3, 4):
         finally:
             app.exit()
 
-    def test_implicit_wrapInstance():
-        """.wrapInstance doesn't need the `base` argument"""
+    def test_implicit_wrapInstance_for_base_types():
+        """Tests .wrapInstance implicit cast of `Foo` pointer to `Foo` object
+
+        Testing is based upon the following parameters:
+
+        1. The `base` argument has a default value.
+        2. `Foo` is a standard Qt class.
+
+        """
         from Qt import QtCompat, QtWidgets
 
         app = QtWidgets.QApplication(sys.argv)
@@ -832,8 +964,9 @@ if sys.version_info <= (3, 4):
             button.setObjectName("MySpecialButton")
             pointer = QtCompat.getCppPointer(button)
             widget = QtCompat.wrapInstance(long(pointer))
-            assert isinstance(widget, QtWidgets.QWidget), widget
+
             assert widget.objectName() == button.objectName()
+            assert type(widget) is QtWidgets.QPushButton, widget
 
             if binding("PySide"):
                 assert widget != button
@@ -848,6 +981,73 @@ if sys.version_info <= (3, 4):
 
         finally:
             app.exit()
+
+    def test_implicit_wrapInstance_for_derived_types():
+        """Tests .wrapInstance implicit cast of `Foo` pointer to `Bar` object
+
+        Testing is based upon the following parameters:
+
+        1. The `base` argument has a default value.
+        2. `Bar` is a standard Qt class.
+        3. `Foo` is a strict subclass of `Bar`, separated by one or more levels
+           of inheritance.
+        4. `Foo` is not a standard Qt class.
+
+        Note:
+            For sip usage, implicit cast of `Foo` pointer always results in a
+            `Foo` object.
+
+        """
+        from Qt import QtCompat, QtWidgets
+
+        app = QtWidgets.QApplication(sys.argv)
+
+        try:
+            class A(QtWidgets.QPushButton):
+                pass
+
+            class B(A):
+                pass
+
+            button = B("Hello world")
+            button.setObjectName("MySpecialButton")
+            pointer = QtCompat.getCppPointer(button)
+            widget = QtCompat.wrapInstance(long(pointer))
+
+            assert widget.objectName() == button.objectName()
+
+            if binding("PyQt4") or binding("PyQt5"):
+                assert type(widget) is B, widget
+            else:
+                assert type(widget) is QtWidgets.QPushButton, widget
+
+            if binding("PySide") or binding("PySide2"):
+                assert widget != button
+            else:
+                assert widget == button
+
+        finally:
+            app.exit()
+
+    def test_implicit_wrapInstance_expectations():
+        """Tests expectations for implicit usage of .wrapInstance
+
+        This includes testing whether the QtCore and QtWidgets namespaces have
+        any overlapping QObject subclass names.
+
+        """
+        import inspect
+        from Qt import QtCore, QtWidgets
+
+        core_class_names = set([attr for attr, value in QtCore.__dict__.items()
+                                if inspect.isclass(value) and
+                                issubclass(value, QtCore.QObject)])
+        widget_class_names = set([attr for attr, value in
+                                  QtWidgets.__dict__.items()
+                                  if inspect.isclass(value) and
+                                  issubclass(value, QtCore.QObject)])
+        intersecting_class_names = core_class_names & widget_class_names
+        assert not intersecting_class_names
 
     def test_isValid():
         """.isValid and .delete work in all bindings"""
